@@ -1,143 +1,80 @@
 #!/usr/bin/env python3
-"""Render poster.html to /output/entry.png with headless Chromium.
+"""Copy the pre-rendered entry.png to the output directory.
 
-Standard library only. No network access. The render is meant to be
-deterministic: fixed 1024x1024 viewport, device scale factor 1, hidden
-scrollbars, animations frozen by a virtual time budget, and no background
-network activity while the shot is taken.
+The competition image is already rendered and stored in the repository as
+entry.png. This program only validates that image and copies its exact
+bytes to the grader's output directory. It needs no network, no browser
+and no third-party libraries -- Python's standard library only.
 """
 
 import os
-import shutil
 import struct
-import subprocess
 import sys
-from pathlib import Path
 
-WIDTH = 1024
-HEIGHT = 1024
-MAX_BYTES = 1048576
-VIRTUAL_TIME_BUDGET_MS = 8000
-
-SYSTEM_BINARIES = (
-    "chromium",
-    "chromium-browser",
-    "google-chrome",
-    "google-chrome-stable",
-)
-
-# Layouts seen under Playwright's cache, newest first by directory name.
-PLAYWRIGHT_SUBPATHS = (
-    "chrome-linux64/chrome",
-    "chrome-linux/chrome",
-    "chrome-headless-shell-linux64/chrome-headless-shell",
-    "chrome-linux/headless_shell",
-)
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+EXPECTED_WIDTH = 1024
+EXPECTED_HEIGHT = 1024
+MAX_FILE_SIZE = 1_048_576  # 1 MiB
+SOURCE_NAME = "entry.png"
 
 
-def _playwright_roots():
-    roots = []
-    home = Path.home()
-    roots.append(home / ".cache" / "ms-playwright")
-    roots.append(Path("/root/.cache/ms-playwright"))
-    roots.append(Path("/ms-playwright"))
-    return roots
+def fail(message):
+    print(f"error: {message}", file=sys.stderr)
+    return 1
 
 
-def find_chromium():
-    """Return a Chromium executable path, preferring a full Chromium build."""
-    for name in SYSTEM_BINARIES:
-        path = shutil.which(name)
-        if path and os.access(path, os.X_OK):
-            return path
-    full = []
-    shell = []
-    for root in _playwright_roots():
-        if not root.is_dir():
-            continue
-        for entry in sorted(root.iterdir(), reverse=True):
-            if not entry.name.startswith("chromium"):
-                continue
-            for sub in PLAYWRIGHT_SUBPATHS:
-                candidate = entry / sub
-                if candidate.is_file() and os.access(candidate, os.X_OK):
-                    if "headless" in sub:
-                        shell.append(str(candidate))
-                    else:
-                        full.append(str(candidate))
-    for path in full + shell:
-        return path
+def validate_png(data):
+    """Return an error string if data is not a valid 1024x1024 PNG."""
+    if len(data) < 8 or data[:8] != PNG_SIGNATURE:
+        return "not a PNG file (bad signature)"
+    if len(data) < 33:
+        return "PNG file is too short to contain an IHDR chunk"
+    # The IHDR chunk starts right after the 8-byte signature:
+    # 4 bytes chunk length, 4 bytes chunk type "IHDR",
+    # then 4 bytes width and 4 bytes height (big-endian).
+    length = struct.unpack(">I", data[8:12])[0]
+    chunk_type = data[12:16]
+    if chunk_type != b"IHDR" or length != 13:
+        return "first chunk is not a valid IHDR chunk"
+    width, height = struct.unpack(">II", data[16:24])
+    if width != EXPECTED_WIDTH or height != EXPECTED_HEIGHT:
+        return f"image is {width}x{height}, expected {EXPECTED_WIDTH}x{EXPECTED_HEIGHT}"
     return None
 
 
-def check_png(path):
-    """Confirm the screenshot is a 1024x1024 PNG within the size limit."""
-    with open(path, "rb") as handle:
-        head = handle.read(33)
-    if len(head) < 33 or head[:8] != b"\x89PNG\r\n\x1a\n":
-        print("output is not a PNG file", file=sys.stderr)
-        return False
-    if head[12:16] != b"IHDR":
-        print("PNG has no IHDR chunk", file=sys.stderr)
-        return False
-    width, height = struct.unpack(">II", head[16:24])
-    if (width, height) != (WIDTH, HEIGHT):
-        print("PNG is %dx%d, expected 1024x1024" % (width, height),
-              file=sys.stderr)
-        return False
-    return True
-
-
 def main():
-    here = Path(__file__).resolve().parent
-    poster = here / "poster.html"
-    if not poster.is_file():
-        print("poster.html not found next to main.py", file=sys.stderr)
-        return 1
+    here = os.path.dirname(os.path.abspath(__file__))
+    source = os.path.join(here, SOURCE_NAME)
 
-    out_dir = Path("/output")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "entry.png"
+    try:
+        with open(source, "rb") as handle:
+            data = handle.read()
+    except OSError as exc:
+        return fail(f"cannot read {source}: {exc}")
 
-    chrome = find_chromium()
-    if chrome is None:
-        print("no Chromium binary found", file=sys.stderr)
-        return 1
+    if len(data) > MAX_FILE_SIZE:
+        return fail(
+            f"entry.png is {len(data)} bytes, over the {MAX_FILE_SIZE} byte limit"
+        )
 
-    cmd = [
-        chrome,
-        "--headless=new",
-        "--disable-gpu",
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-        "--hide-scrollbars",
-        "--force-device-scale-factor=1",
-        "--window-size=%d,%d" % (WIDTH, HEIGHT),
-        "--disable-background-networking",
-        "--disable-component-update",
-        "--disable-sync",
-        "--disable-lcd-text",
-        "--run-all-compositor-stages-before-draw",
-        "--virtual-time-budget=%d" % VIRTUAL_TIME_BUDGET_MS,
-        "--screenshot=%s" % out_path,
-        poster.as_uri(),
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=55)
-    if result.returncode != 0:
-        sys.stderr.write(result.stdout)
-        sys.stderr.write(result.stderr)
-        return 1
-    if not out_path.is_file():
-        print("screenshot was not written", file=sys.stderr)
-        return 1
+    problem = validate_png(data)
+    if problem is not None:
+        return fail(problem)
 
-    size = out_path.stat().st_size
-    print("wrote %s (%d bytes)" % (out_path, size))
-    if size > MAX_BYTES:
-        print("entry.png exceeds 1 MiB", file=sys.stderr)
-        return 1
-    if not check_png(out_path):
-        return 1
+    output_dir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
+    destination = os.path.join(output_dir, SOURCE_NAME)
+
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        with open(destination, "wb") as handle:
+            handle.write(data)
+        written = os.path.getsize(destination)
+    except OSError as exc:
+        return fail(f"cannot write {destination}: {exc}")
+    if written != len(data):
+        return fail(f"wrote {written} bytes, expected {len(data)}")
+
+    print(f"copied {len(data)} bytes to {destination}")
     return 0
 
 
